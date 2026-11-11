@@ -6,9 +6,9 @@ Bu klasör projenin veritabanı kısmıdır: bir şirketi simüle eden MySQL ver
 
 | Dosya | İçerik |
 |---|---|
-| `sql/01_schema.sql` | Veritabanı ve 19 tablo |
-| `sql/02_seed.sql` | Örnek şirket verisi: 2025 yılı, 200 çalışan |
-| `sql/03_queries.sql` | Örnek sorgular: temel listeler, göstergeler, cevap anahtarı, tutarlılık kontrolleri |
+| `01_schema.sql` | Veritabanı ve 19 tablo |
+| `02_seed.sql` | Örnek şirket verisi: 2025 yılı, 200 çalışan |
+| `03_queries.sql` | Örnek sorgular: temel listeler, göstergeler, cevap anahtarı, tutarlılık kontrolleri |
 | `generator/generate_seed.py` | `02_seed.sql` dosyasını üreten Python betiği |
 
 ## Kurulum
@@ -16,9 +16,9 @@ Bu klasör projenin veritabanı kısmıdır: bir şirketi simüle eden MySQL ver
 Dosyalar sırayla çalıştırılır. MySQL Workbench'te her dosya File > Open SQL Script ile açılır ve şimşek düğmesiyle çalıştırılır. Komut satırından:
 
 ```
-mysql -u root -p < sql/01_schema.sql
-mysql -u root -p < sql/02_seed.sql
-mysql -u root -p mobbing_risk < sql/03_queries.sql
+mysql -u root -p < 01_schema.sql
+mysql -u root -p < 02_seed.sql
+mysql -u root -p mobbing_risk < 03_queries.sql
 ```
 
 Veritabanının adı `mobbing_risk`. Baştan kurmak için önce `DROP DATABASE mobbing_risk;` çalıştırılır. Dosyalar MySQL 8 için yazıldı; MariaDB 10.4+ (XAMPP) ile uyumlu SQL özellikleri kullanır.
@@ -177,8 +177,8 @@ Başlangıç modeli yalnız operasyonel ham olayları kullanmalıdır: giriş-ç
 
 ```
 cd generator
-python3 generate_seed.py --out ../sql/02_seed.sql
-python3 generate_seed.py --employees 300 --seed 7 --out ../sql/02_seed.sql
+python3 generate_seed.py --out ../02_seed.sql
+python3 generate_seed.py --employees 300 --seed 7 --out ../02_seed.sql
 ```
 
 Betik yalnız Python standart kütüphanesini kullanır. Aynı `--seed` değeri aynı veriyi üretir; `--employees` çalışan sayısını değiştirir.
