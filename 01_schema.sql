@@ -9,8 +9,9 @@
 -- Tablolar altı grupta toplanır:
 --   1. Organizasyon : departments, employees
 --   2. Zaman        : attendance_logs, leave_requests
---   3. İş           : tasks, meetings, meeting_participants
---   4. Değerlendirme: performance_reviews, complaints
+--   3. İş           : employee_requests, tasks, task_changes, meetings,
+--                     meeting_participants
+--   4. Değerlendirme: feedback_events, performance_reviews, complaints
 --   5. Anket        : surveys, survey_questions, survey_answers
 --   6. Analiz       : risk_assessments, simulation_scenarios,
 --                     simulation_labels, dataset_splits
@@ -91,8 +92,32 @@ CREATE TABLE leave_requests (
 );
 
 -- ---------------------------------------------------------------------
--- 3. İŞ: görevler ve toplantılar
+-- 3. İŞ: talepler, görevler ve toplantılar
 -- ---------------------------------------------------------------------
+
+-- Çalışanın başka bir çalışandan istediği bilgi, onay, kaynak veya planlama desteği.
+-- Görülme, ilk yanıt ve sonuç zamanları ayrı tutulur; böylece cevapsız bırakılma
+-- ve ekip arkadaşlarına göre seçici geciktirme ölçülebilir.
+CREATE TABLE employee_requests (
+  request_id        INT      NOT NULL AUTO_INCREMENT,
+  requester_id      INT      NOT NULL,
+  recipient_id      INT      NOT NULL,
+  request_type      ENUM('information','approval','resource','schedule','other') NOT NULL,
+  priority          ENUM('low','medium','high') NOT NULL DEFAULT 'medium',
+  created_at        DATETIME NOT NULL,
+  seen_at           DATETIME NULL,
+  first_response_at DATETIME NULL,
+  resolved_at       DATETIME NULL,
+  outcome           ENUM('approved','rejected','partial','no_action') NULL,
+  PRIMARY KEY (request_id),
+  FOREIGN KEY (requester_id) REFERENCES employees (employee_id),
+  FOREIGN KEY (recipient_id) REFERENCES employees (employee_id),
+  CHECK (requester_id <> recipient_id),
+  CHECK (seen_at IS NULL OR seen_at >= created_at),
+  CHECK (first_response_at IS NULL OR first_response_at >= created_at),
+  CHECK (resolved_at IS NULL OR resolved_at >= created_at),
+  CHECK ((resolved_at IS NULL AND outcome IS NULL) OR (resolved_at IS NOT NULL AND outcome IS NOT NULL))
+);
 
 -- Görevler: kime verildi, kim verdi, ne zaman verildi, ne zaman istendi, ne zaman bitti.
 -- Biten görevde status 'done' olur ve completed_at dolar.
@@ -106,11 +131,30 @@ CREATE TABLE tasks (
   completed_at    DATETIME     NULL,
   priority        ENUM('low','medium','high','urgent') NOT NULL DEFAULT 'medium',
   estimated_hours DECIMAL(4,1) NOT NULL,
+  actual_hours    DECIMAL(5,1) NULL,
   status          ENUM('open','in_progress','done','cancelled') NOT NULL DEFAULT 'open',
   PRIMARY KEY (task_id),
   FOREIGN KEY (assigned_to) REFERENCES employees (employee_id),
   FOREIGN KEY (assigned_by) REFERENCES employees (employee_id),
-  CHECK (due_at > assigned_at)
+  CHECK (due_at > assigned_at),
+  CHECK (actual_hours IS NULL OR actual_hours > 0)
+);
+
+-- Görev verildikten sonra yapılan baskı yaratabilecek değişiklikler.
+-- old_due_at ve new_due_at yalnızca son tarih değişikliklerinde dolar.
+CREATE TABLE task_changes (
+  task_change_id INT      NOT NULL AUTO_INCREMENT,
+  task_id        INT      NOT NULL,
+  changed_by     INT      NOT NULL,
+  change_type    ENUM('deadline_shortened','deadline_extended','priority_increased','reassigned') NOT NULL,
+  old_due_at     DATETIME NULL,
+  new_due_at     DATETIME NULL,
+  changed_at     DATETIME NOT NULL,
+  PRIMARY KEY (task_change_id),
+  FOREIGN KEY (task_id)    REFERENCES tasks (task_id) ON DELETE CASCADE,
+  FOREIGN KEY (changed_by) REFERENCES employees (employee_id),
+  CHECK ((change_type IN ('deadline_shortened','deadline_extended') AND old_due_at IS NOT NULL AND new_due_at IS NOT NULL)
+      OR (change_type IN ('priority_increased','reassigned') AND old_due_at IS NULL AND new_due_at IS NULL))
 );
 
 -- Toplantılar.
@@ -133,19 +177,42 @@ CREATE TABLE meetings (
 -- Satır varsa kişi davet edilmiştir; attended katılıp katılmadığını söyler.
 -- Ekip toplantısına çağrılmayan ekip üyesinin burada satırı olmaz.
 CREATE TABLE meeting_participants (
-  participant_id INT     NOT NULL AUTO_INCREMENT,
-  meeting_id     INT     NOT NULL,
-  employee_id    INT     NOT NULL,
-  attended       BOOLEAN NOT NULL DEFAULT FALSE,
+  participant_id   INT      NOT NULL AUTO_INCREMENT,
+  meeting_id       INT      NOT NULL,
+  employee_id      INT      NOT NULL,
+  invited_at       DATETIME NOT NULL,
+  responded_at     DATETIME NULL,
+  removed_at       DATETIME NULL,
+  invitation_status ENUM('invited','accepted','declined','removed') NOT NULL DEFAULT 'invited',
+  attended         BOOLEAN  NOT NULL DEFAULT FALSE,
   PRIMARY KEY (participant_id),
   UNIQUE (meeting_id, employee_id),
   FOREIGN KEY (meeting_id)  REFERENCES meetings (meeting_id) ON DELETE CASCADE,
-  FOREIGN KEY (employee_id) REFERENCES employees (employee_id)
+  FOREIGN KEY (employee_id) REFERENCES employees (employee_id),
+  CHECK (responded_at IS NULL OR responded_at >= invited_at),
+  CHECK (removed_at IS NULL OR removed_at >= invited_at),
+  CHECK ((invitation_status = 'removed' AND removed_at IS NOT NULL)
+      OR (invitation_status <> 'removed' AND removed_at IS NULL))
 );
 
 -- ---------------------------------------------------------------------
 -- 4. DEĞERLENDİRME: performans ve şikâyet
 -- ---------------------------------------------------------------------
+
+-- Günlük geri bildirim olayı. Tür kadar geri bildirimin özel mi yoksa ekip
+-- önünde mi verildiği de tutulur; tek bir olaydan çok tekrar eden örüntü önemlidir.
+CREATE TABLE feedback_events (
+  feedback_id   INT      NOT NULL AUTO_INCREMENT,
+  employee_id   INT      NOT NULL,
+  given_by      INT      NOT NULL,
+  feedback_type ENUM('praise','correction','warning','criticism') NOT NULL,
+  visibility    ENUM('private','team','department') NOT NULL DEFAULT 'private',
+  created_at    DATETIME NOT NULL,
+  PRIMARY KEY (feedback_id),
+  FOREIGN KEY (employee_id) REFERENCES employees (employee_id),
+  FOREIGN KEY (given_by)    REFERENCES employees (employee_id),
+  CHECK (employee_id <> given_by)
+);
 
 -- Çeyreklik performans değerlendirmesi. Puan 1.0 ile 5.0 arasındadır.
 CREATE TABLE performance_reviews (
@@ -255,6 +322,8 @@ CREATE TABLE risk_assessments (
 --   has_exclusion         ekip toplantılarına çağırmama
 --   has_leave_denial      izin başvurularını reddetme ve geciktirme
 --   has_unfair_evaluation performans puanını düşürme
+--   has_request_ignoring  talepleri görmeme, yanıtsız bırakma veya geciktirme
+--   has_public_criticism  eleştiriyi ekip/departman önünde tekrarlama
 CREATE TABLE simulation_scenarios (
   scenario_id           INT     NOT NULL AUTO_INCREMENT,
   employee_id           INT     NOT NULL,
@@ -265,6 +334,8 @@ CREATE TABLE simulation_scenarios (
   has_exclusion         BOOLEAN NOT NULL DEFAULT FALSE,
   has_leave_denial      BOOLEAN NOT NULL DEFAULT FALSE,
   has_unfair_evaluation BOOLEAN NOT NULL DEFAULT FALSE,
+  has_request_ignoring  BOOLEAN NOT NULL DEFAULT FALSE,
+  has_public_criticism  BOOLEAN NOT NULL DEFAULT FALSE,
   PRIMARY KEY (scenario_id),
   UNIQUE (employee_id),
   FOREIGN KEY (employee_id)    REFERENCES employees (employee_id),

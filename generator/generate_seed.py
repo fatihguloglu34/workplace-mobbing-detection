@@ -10,11 +10,13 @@ Yalnız Python standart kütüphanesini kullanır. Aynı --seed aynı veriyi ür
 Simülasyonun mantığı:
   * 2025 yılı boyunca çalışan bir şirket kurulur (departman, ekip, yönetici).
   * Çalışanların yaklaşık yüzde 10'u bir "senaryo"ya girer: yöneticisi belirli
-    aylar arasında ona dört yoldan biri ya da birkaçıyla baskı uygular:
+    aylar arasında ona altı yoldan biri ya da birkaçıyla baskı uygular:
       overload           fazla görev, dar süre, mesai dışı görev, ek mesai
       exclusion          ekip toplantılarına çağırmama
       leave_denial       izin başvurularını reddetme ve geciktirme
       unfair_evaluation  performans puanını düşürme
+      request_ignoring   iş taleplerini görmeme, yanıtsız bırakma veya geciktirme
+      public_criticism   eleştiriyi ekip ya da departman önünde tekrarlama
   * Modeli yanıltacak zararsız durumlar da eklenir: bütün ekibin yoğun çalıştığı
     dönemler, sürekli çok çalışanlar, puanı hep düşük olanlar.
   * Hangi çalışanın hangi ayda senaryo içinde olduğu simulation_* tablolarına
@@ -96,13 +98,17 @@ SURVEY_QUESTIONS = [
     ("respect", "İş yerinde kendimi yalnız bırakılmış hissediyorum."),
 ]
 # Senaryo yolu -> (olasılık, ilgili anket boyutu, ilgili şikâyet kategorisi)
+# Her yolun anket karşılığı olmak zorunda değildir; None ise yalnız operasyonel
+# olaylardan ölçülür.
 SCENARIO_FLAGS = {
     "overload": (0.60, "workload", "overload"),
     "exclusion": (0.55, "exclusion", "exclusion"),
     "leave_denial": (0.40, "rights", "rights"),
     "unfair_evaluation": (0.60, "fairness", "unfair_evaluation"),
+    "request_ignoring": (0.45, None, "other"),
+    "public_criticism": (0.40, "respect", "verbal"),
 }
-DIMENSION_FLAG = {dimension: flag for flag, (_, dimension, _) in SCENARIO_FLAGS.items()}
+DIMENSION_FLAG = {dimension: flag for flag, (_, dimension, _) in SCENARIO_FLAGS.items() if dimension}
 
 REVIEW_WINDOWS = {1: (dt.date(YEAR, 4, 7), dt.date(YEAR, 4, 18)), 2: (dt.date(YEAR, 7, 7), dt.date(YEAR, 7, 18)),
                   3: (dt.date(YEAR, 10, 6), dt.date(YEAR, 10, 17)), 4: (dt.date(YEAR, 12, 15), dt.date(YEAR, 12, 26))}
@@ -442,7 +448,77 @@ class Simulation:
         rows.sort(key=lambda row: (row[1], row[0]))
         self.tables["attendance_logs"] = rows
 
-    # ---- 4. görevler ----
+    # ---- 4. çalışan talepleri ----
+
+    def build_requests(self):
+        """İş talepleri; görülme, ilk yanıt ve çözüm zamanları birbirinden ayrıdır."""
+        rng, rows = self.rng, []
+        staff = [e for e in self.employees if e["manager"]]
+        request_types = ["information", "approval", "resource", "schedule", "other"]
+
+        for emp in staff:
+            for month in range(1, 13):
+                days = [d for d in WORKDAYS_BY_MONTH[month] if self.employed(emp, d)]
+                if not days:
+                    continue
+                count = self.poisson(1.7 * len(days) / len(WORKDAYS_BY_MONTH[month]))
+                ignoring = self.factor(emp["id"], month, "request_ignoring")
+                if ignoring:
+                    count += self.poisson(1.2 * ignoring)
+
+                for _ in range(count):
+                    day = rng.choice(days)
+                    created = at(day, rng.randint(8 * 60 + 30, 17 * 60 + 30))
+                    colleagues = [e for e in self.employees
+                                  if e["dept"] == emp["dept"] and e["id"] != emp["id"]
+                                  and self.employed(e, day)]
+                    if ignoring and rng.random() < 0.72:
+                        recipient = self.scenarios[emp["id"]]["perpetrator"]
+                    elif rng.random() < 0.72:
+                        recipient = emp["manager"]
+                    elif colleagues:
+                        recipient = rng.choice(colleagues)["id"]
+                    else:
+                        recipient = emp["manager"]
+
+                    targeted = bool(ignoring and recipient == self.scenarios[emp["id"]]["perpetrator"])
+                    busy = self.crunch(emp, month)
+                    priority = rng.choices(["low", "medium", "high"], [0.18, 0.65, 0.17])[0]
+                    request_type = rng.choices(request_types, [0.34, 0.24, 0.15, 0.18, 0.09])[0]
+
+                    if targeted and rng.random() < 0.24:
+                        seen = response = resolved = outcome = None
+                    else:
+                        seen_hours = rng.uniform(18, 96) * ignoring if targeted else rng.uniform(0.05, 10 + 24 * busy)
+                        seen = (created + dt.timedelta(hours=seen_hours)).replace(second=0, microsecond=0)
+                        no_response = rng.random() < (0.52 if targeted else 0.12 if busy else 0.055)
+                        if no_response or seen > DATA_END:
+                            response = resolved = outcome = None
+                            if seen > DATA_END:
+                                seen = None
+                        else:
+                            response_hours = rng.uniform(36, 168) * ignoring if targeted else rng.uniform(0.1, 18 + 36 * busy)
+                            response = (seen + dt.timedelta(hours=response_hours)).replace(second=0, microsecond=0)
+                            if response > DATA_END:
+                                response = None
+                                resolved = outcome = None
+                            elif rng.random() < (0.60 if targeted else 0.88):
+                                resolved = (response + dt.timedelta(hours=rng.uniform(0.2, 72))).replace(second=0, microsecond=0)
+                                if resolved > DATA_END:
+                                    resolved = outcome = None
+                                else:
+                                    outcome = rng.choices(["approved", "rejected", "partial", "no_action"],
+                                                          [0.56, 0.17, 0.20, 0.07] if not targeted
+                                                          else [0.22, 0.24, 0.20, 0.34])[0]
+                            else:
+                                resolved = outcome = None
+                    rows.append((emp["id"], recipient, request_type, priority, created,
+                                 seen, response, resolved, outcome))
+
+        rows.sort(key=lambda row: row[4])
+        self.tables["employee_requests"] = [(i + 1, *row) for i, row in enumerate(rows)]
+
+    # ---- 5. görevler ----
 
     def build_tasks(self):
         rng, rows = self.rng, []
@@ -464,9 +540,11 @@ class Simulation:
                     extra = self.poisson(rate * share * rng.uniform(0.9, 1.5) * overload)
                     rows += [self.pressure_task(emp, scenario, workdays, all_days) for _ in range(extra)]
         rows.sort(key=lambda row: row[3])
-        self.tables["tasks"] = [(i + 1, *row) for i, row in enumerate(rows)]
+        tasks = [(i + 1, *row) for i, row in enumerate(rows)]
+        self.tables["tasks"] = tasks
+        self.build_task_changes(tasks)
 
-    def task_row(self, emp, assigner, assigned, due, completed, priority, hours):
+    def task_row(self, emp, assigner, assigned, due, completed, priority, hours, effort_factor=1.0):
         if completed and completed > DATA_END:
             completed = None
         if completed:
@@ -475,8 +553,12 @@ class Simulation:
             status = "cancelled"
         else:
             status = self.rng.choice(["open", "in_progress"])
+        actual_hours = None
+        if completed:
+            late_factor = 1.18 if completed > due else 1.0
+            actual_hours = round(clamp(self.rng.gauss(hours * effort_factor * late_factor, max(0.6, hours * 0.18)), 0.5, 99.0), 1)
         title = f"{self.rng.choice(TASK_ACTIONS[emp['dept']])}: {self.rng.choice(TASK_SUBJECTS)}"
-        return (title, emp["id"], assigner, assigned, due, completed, priority, hours, status)
+        return (title, emp["id"], assigner, assigned, due, completed, priority, hours, actual_hours, status)
 
     def finish_within(self, assigned, due):
         """Dar süreli görevin süresi içinde bitiş anı."""
@@ -521,7 +603,8 @@ class Simulation:
         elif roll < on_time + late:
             completed = due + dt.timedelta(minutes=rng.randint(120, 72 * 60))
         priority = "urgent" if urgent else rng.choices(["low", "medium", "high"], [0.22, 0.56, 0.22])[0]
-        return self.task_row(emp, assigner, assigned, due, completed, priority, hours)
+        return self.task_row(emp, assigner, assigned, due, completed, priority, hours,
+                             1.12 if overload or crunch else 1.0)
 
     def pressure_task(self, emp, scenario, workdays, all_days):
         """Senaryodaki yöneticinin verdiği görev: dar süreli, çoğu acil, sık sık mesai dışı."""
@@ -538,20 +621,74 @@ class Simulation:
         elif roll < 0.88:
             completed = due + dt.timedelta(minutes=rng.randint(4 * 60, 96 * 60))
         priority = rng.choices(["urgent", "high", "medium"], [0.5, 0.4, 0.1])[0]
-        return self.task_row(emp, scenario["perpetrator"], assigned, due, completed, priority, rng.choice([6, 8, 12, 16, 20]))
+        return self.task_row(emp, scenario["perpetrator"], assigned, due, completed, priority,
+                             rng.choice([6, 8, 12, 16, 20]), 1.30)
 
-    # ---- 5. toplantılar ----
+    def build_task_changes(self, tasks):
+        """Görev geçmişine hem sıradan revizyonlar hem hedefli son tarih baskısı ekler."""
+        rng, rows = self.rng, []
+        for task in tasks:
+            task_id, _, assigned_to, assigned_by, assigned_at, due_at = task[:6]
+            scenario = self.scenarios.get(assigned_to)
+            overload = self.factor(assigned_to, assigned_at.month, "overload")
+            targeted = bool(overload and scenario and assigned_by == scenario["perpetrator"])
+            if rng.random() >= (0.24 if targeted else 0.065):
+                continue
+
+            change_type = rng.choices(
+                ["deadline_shortened", "deadline_extended", "priority_increased", "reassigned"],
+                [0.58, 0.06, 0.31, 0.05] if targeted else [0.20, 0.43, 0.27, 0.10]
+            )[0]
+            span_minutes = max(30, int((due_at - assigned_at).total_seconds() / 60))
+            changed_at = assigned_at + dt.timedelta(minutes=rng.randint(15, max(15, int(span_minutes * 0.65))))
+            if change_type == "deadline_shortened":
+                old_due = due_at + dt.timedelta(hours=rng.randint(12, 96))
+                new_due = due_at
+            elif change_type == "deadline_extended":
+                old_due = max(assigned_at + dt.timedelta(minutes=30),
+                              due_at - dt.timedelta(hours=rng.randint(6, 48)))
+                new_due = due_at
+            else:
+                old_due = new_due = None
+            rows.append((task_id, assigned_by, change_type, old_due, new_due, changed_at))
+        rows.sort(key=lambda row: row[5])
+        self.tables["task_changes"] = [(i + 1, *row) for i, row in enumerate(rows)]
+
+    # ---- 6. toplantılar ----
 
     def build_meetings(self):
-        rng, meetings = self.rng, []   # (başlangıç, tür, düzenleyen, süre, başlık, {çalışan: katıldı mı})
+        rng, meetings = self.rng, []   # son öğe: {çalışan: davet ayrıntıları}
         ceo = self.employees[0]
 
         def add(day, minutes, kind, organizer, duration, title, invited, attend_rate):
-            people = {organizer: 1}
+            starts = at(day, minutes)
+            organizer_invited = starts - dt.timedelta(days=7)
+            people = {organizer: (organizer_invited, organizer_invited, None, "accepted", 1)}
             for emp_id in invited:
                 if emp_id != organizer and self.employed(self.by_id[emp_id], day):
-                    people[emp_id] = 0 if day in self.approved_leave[emp_id] else int(rng.random() < attend_rate)
-            meetings.append((at(day, minutes), kind, organizer, duration, title, people))
+                    exclusion = self.factor(emp_id, day.month, "exclusion")
+                    if exclusion and rng.random() < 0.45:
+                        invited_at = starts - dt.timedelta(minutes=rng.randint(20, 6 * 60))
+                    else:
+                        invited_at = starts - dt.timedelta(hours=rng.uniform(18, 9 * 24))
+                    invited_at = invited_at.replace(second=0, microsecond=0)
+                    removed_chance = 0.18 * exclusion + 0.015
+                    if rng.random() < removed_chance:
+                        removed_at = invited_at + (starts - invited_at) * rng.uniform(0.2, 0.9)
+                        people[emp_id] = (invited_at, None, removed_at.replace(second=0, microsecond=0), "removed", 0)
+                        continue
+                    if rng.random() < 0.08:
+                        responded_at, status, attended = None, "invited", 0
+                    else:
+                        responded_at = invited_at + (starts - invited_at) * rng.uniform(0.05, 0.8)
+                        if day in self.approved_leave[emp_id] or rng.random() > 0.93:
+                            status, attended = "declined", 0
+                        else:
+                            status = "accepted"
+                            attended = int(rng.random() < attend_rate)
+                        responded_at = responded_at.replace(second=0, microsecond=0)
+                    people[emp_id] = (invited_at, responded_at, None, status, attended)
+            meetings.append((starts, kind, organizer, duration, title, people))
 
         # Haftalık ekip toplantıları: yönetici kendi ekibini çağırır
         for boss_id, members in self.reports.items():
@@ -595,10 +732,39 @@ class Simulation:
 
         meetings.sort(key=lambda m: m[0])
         self.tables["meetings"] = [(i + 1, m[4], m[1], m[2], m[0], m[3]) for i, m in enumerate(meetings)]
-        self.tables["meeting_participants"] = [(i + 1, emp_id, attended)
-                                               for i, m in enumerate(meetings) for emp_id, attended in m[5].items()]
+        self.tables["meeting_participants"] = [(i + 1, emp_id, *details)
+                                               for i, m in enumerate(meetings) for emp_id, details in m[5].items()]
 
-    # ---- 6. performans ----
+    # ---- 7. geri bildirim ----
+
+    def build_feedback(self):
+        rng, rows = self.rng, []
+        for emp in self.employees:
+            if not emp["manager"]:
+                continue
+            for month in range(1, 13):
+                days = [d for d in WORKDAYS_BY_MONTH[month] if self.employed(emp, d)]
+                if not days:
+                    continue
+                public_criticism = self.factor(emp["id"], month, "public_criticism")
+                count = self.poisson(0.9 + 0.8 * public_criticism)
+                for _ in range(count):
+                    created = at(rng.choice(days), rng.randint(9 * 60, 17 * 60 + 30))
+                    if public_criticism and rng.random() < 0.70:
+                        feedback_type = rng.choices(["criticism", "warning", "correction"], [0.62, 0.16, 0.22])[0]
+                        visibility = rng.choices(["team", "department", "private"], [0.64, 0.20, 0.16])[0]
+                    else:
+                        feedback_type = rng.choices(["praise", "correction", "warning", "criticism"],
+                                                    [0.51, 0.31, 0.08, 0.10])[0]
+                        if feedback_type == "praise":
+                            visibility = rng.choices(["private", "team", "department"], [0.38, 0.53, 0.09])[0]
+                        else:
+                            visibility = rng.choices(["private", "team", "department"], [0.84, 0.14, 0.02])[0]
+                    rows.append((emp["id"], emp["manager"], feedback_type, visibility, created))
+        rows.sort(key=lambda row: row[4])
+        self.tables["feedback_events"] = [(i + 1, *row) for i, row in enumerate(rows)]
+
+    # ---- 8. performans ----
 
     def build_reviews(self):
         rng, rows = self.rng, []
@@ -716,8 +882,10 @@ class Simulation:
         self.build_scenarios()
         self.build_leaves()
         self.build_attendance()
+        self.build_requests()
         self.build_tasks()
         self.build_meetings()
+        self.build_feedback()
         self.build_reviews()
         self.build_complaints()
         self.build_surveys()
@@ -741,16 +909,22 @@ TABLE_COLUMNS = [
     ("leave_requests", "leave_request_id, employee_id, leave_type, start_date, end_date, requested_at, status, "
                        "decided_by, decided_at, decision_note"),
     ("attendance_logs", "employee_id, work_date, check_in, check_out"),
-    ("tasks", "task_id, title, assigned_to, assigned_by, assigned_at, due_at, completed_at, priority, estimated_hours, status"),
+    ("employee_requests", "request_id, requester_id, recipient_id, request_type, priority, created_at, seen_at, "
+                          "first_response_at, resolved_at, outcome"),
+    ("tasks", "task_id, title, assigned_to, assigned_by, assigned_at, due_at, completed_at, priority, "
+              "estimated_hours, actual_hours, status"),
+    ("task_changes", "task_change_id, task_id, changed_by, change_type, old_due_at, new_due_at, changed_at"),
     ("meetings", "meeting_id, title, meeting_type, organizer_id, starts_at, duration_minutes"),
-    ("meeting_participants", "meeting_id, employee_id, attended"),
+    ("meeting_participants", "meeting_id, employee_id, invited_at, responded_at, removed_at, invitation_status, attended"),
+    ("feedback_events", "feedback_id, employee_id, given_by, feedback_type, visibility, created_at"),
     ("performance_reviews", "review_id, employee_id, reviewer_id, period_year, period_quarter, score, comment, reviewed_at"),
     ("complaints", "complaint_id, reporter_id, accused_id, category, occurred_on, reported_at, description, status, is_anonymous"),
     ("surveys", "survey_id, title, description, opens_on, closes_on"),
     ("survey_questions", "question_id, survey_id, question_order, question_text, dimension"),
     ("survey_answers", "question_id, employee_id, score, answered_at"),
     ("simulation_scenarios", "scenario_id, employee_id, perpetrator_id, start_month, end_month, has_overload, "
-                             "has_exclusion, has_leave_denial, has_unfair_evaluation"),
+                             "has_exclusion, has_leave_denial, has_unfair_evaluation, has_request_ignoring, "
+                             "has_public_criticism"),
     ("simulation_labels", "employee_id, period_month, is_mobbing"),
     ("dataset_splits", "employee_id, split"),
 ]
