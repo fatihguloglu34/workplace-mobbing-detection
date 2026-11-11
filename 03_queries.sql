@@ -210,6 +210,132 @@ GROUP BY a.employee_id, q.dimension
 HAVING ortalama >= 4
 ORDER BY a.employee_id, q.dimension;
 
+-- B11. Aylık talep davranışı: görülme/yanıt/çözüm süresi ve yanıtsızlık.
+-- Son 7 günde açılan taleplerin henüz yanıtlanmamış olması normal olabileceği için
+-- yanıtsız oranına yalnız en az 7 günlük talepler alınır.
+SELECT requester_id AS employee_id,
+       DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+       COUNT(*) AS talep_sayisi,
+       ROUND(AVG(TIMESTAMPDIFF(MINUTE, created_at, seen_at)) / 60, 1) AS ortalama_gorulme_saati,
+       ROUND(AVG(TIMESTAMPDIFF(MINUTE, created_at, first_response_at)) / 60, 1) AS ortalama_yanit_saati,
+       SUM(first_response_at IS NULL AND created_at < '2025-12-25') AS yedi_gun_cevapsiz,
+       ROUND(SUM(first_response_at IS NULL AND created_at < '2025-12-25') /
+             NULLIF(SUM(created_at < '2025-12-25'), 0), 2) AS cevapsiz_orani,
+       SUM(resolved_at IS NULL) AS sonuclanmamis
+FROM employee_requests
+GROUP BY requester_id, period_month
+ORDER BY cevapsiz_orani DESC, ortalama_yanit_saati DESC;
+
+-- B12. Aynı alıcının aynı ayda yanıtladığı kişilerle karşılaştırma.
+-- goreli_yanit_orani 1'in üstündeyse bu çalışana ortalamadan daha geç yanıt verilmiştir.
+WITH kisi AS (
+  SELECT requester_id,
+         recipient_id,
+         DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+         COUNT(*) AS talep,
+         AVG(TIMESTAMPDIFF(MINUTE, created_at, first_response_at)) / 60 AS yanit_saati,
+         AVG(first_response_at IS NULL) AS cevapsiz_orani
+  FROM employee_requests
+  GROUP BY requester_id, recipient_id, period_month
+), karsilastirma AS (
+  SELECT kisi.*,
+         AVG(yanit_saati) OVER (PARTITION BY recipient_id, period_month) AS alici_ortalamasi,
+         AVG(cevapsiz_orani) OVER (PARTITION BY recipient_id, period_month) AS alici_cevapsiz_ortalamasi
+  FROM kisi
+)
+SELECT requester_id AS employee_id,
+       recipient_id,
+       period_month,
+       talep,
+       ROUND(yanit_saati, 1) AS yanit_saati,
+       ROUND(alici_ortalamasi, 1) AS alici_ortalamasi,
+       ROUND(yanit_saati / NULLIF(alici_ortalamasi, 0), 2) AS goreli_yanit_orani,
+       ROUND(cevapsiz_orani - alici_cevapsiz_ortalamasi, 2) AS goreli_cevapsizlik_farki
+FROM karsilastirma
+WHERE talep >= 2
+ORDER BY goreli_cevapsizlik_farki DESC, goreli_yanit_orani DESC;
+
+-- B13. Ekip toplantılarında hiç davet edilmeme, davetten çıkarılma ve geç davet.
+SELECT e.employee_id,
+       DATE_FORMAT(m.starts_at, '%Y-%m-01') AS period_month,
+       COUNT(*) AS beklenen_toplanti,
+       SUM(p.participant_id IS NULL) AS davet_edilmedi,
+       SUM(p.invitation_status = 'removed') AS davetten_cikarildi,
+       SUM(p.participant_id IS NOT NULL AND
+           TIMESTAMPDIFF(MINUTE, p.invited_at, m.starts_at) < 6 * 60) AS gec_davet,
+       ROUND(SUM(p.participant_id IS NULL OR p.invitation_status = 'removed') / COUNT(*), 2) AS erisim_kaybi_orani
+FROM employees e
+JOIN meetings m
+  ON m.meeting_type = 'team'
+ AND m.organizer_id = e.manager_id
+ AND DATE(m.starts_at) BETWEEN e.hire_date AND COALESCE(e.termination_date, '9999-12-31')
+LEFT JOIN meeting_participants p
+  ON p.meeting_id = m.meeting_id
+ AND p.employee_id = e.employee_id
+GROUP BY e.employee_id, period_month
+HAVING beklenen_toplanti >= 3
+ORDER BY erisim_kaybi_orani DESC, gec_davet DESC;
+
+-- B14. Aylık görev efor sapması ve görev verildikten sonraki baskı yaratabilecek değişiklikler.
+WITH degisim AS (
+  SELECT task_id,
+         SUM(change_type = 'deadline_shortened') AS sure_kisaltma,
+         SUM(change_type = 'deadline_extended') AS sure_uzatma,
+         SUM(change_type = 'priority_increased') AS oncelik_artirma,
+         SUM(change_type = 'reassigned') AS yeniden_atama
+  FROM task_changes
+  GROUP BY task_id
+)
+SELECT t.assigned_to AS employee_id,
+       DATE_FORMAT(t.assigned_at, '%Y-%m-01') AS period_month,
+       COUNT(*) AS gorev,
+       ROUND(AVG(t.actual_hours / NULLIF(t.estimated_hours, 0)), 2) AS gercek_tahmin_orani,
+       SUM(COALESCE(d.sure_kisaltma, 0)) AS sure_kisaltma,
+       SUM(COALESCE(d.sure_uzatma, 0)) AS sure_uzatma,
+       SUM(COALESCE(d.oncelik_artirma, 0)) AS oncelik_artirma,
+       SUM(COALESCE(d.yeniden_atama, 0)) AS yeniden_atama
+FROM tasks t
+LEFT JOIN degisim d ON d.task_id = t.task_id
+GROUP BY t.assigned_to, period_month
+ORDER BY sure_kisaltma DESC, oncelik_artirma DESC;
+
+-- B15. Aylık geri bildirim: özel düzeltme ile topluluk önünde olumsuz geri bildirimi ayırır.
+SELECT employee_id,
+       DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+       COUNT(*) AS geri_bildirim,
+       SUM(feedback_type = 'praise') AS ovgu,
+       SUM(feedback_type IN ('warning','criticism') AND visibility <> 'private') AS topluluk_onunde_olumsuz,
+       SUM(feedback_type = 'correction' AND visibility = 'private') AS ozel_duzeltme,
+       ROUND(SUM(feedback_type IN ('warning','criticism') AND visibility <> 'private') / COUNT(*), 2)
+         AS topluluk_onunde_olumsuz_orani
+FROM feedback_events
+GROUP BY employee_id, period_month
+ORDER BY topluluk_onunde_olumsuz_orani DESC, topluluk_onunde_olumsuz DESC;
+
+-- B16. Talep yanıt süresindeki aylık değişim. Tek bir kötü aydan çok, art arda kötüleşme
+-- model için daha güçlü bir özellik olabilir.
+WITH aylik AS (
+  SELECT requester_id AS employee_id,
+         DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+         AVG(TIMESTAMPDIFF(MINUTE, created_at, first_response_at)) / 60 AS yanit_saati,
+         AVG(first_response_at IS NULL) AS cevapsiz_orani
+  FROM employee_requests
+  GROUP BY requester_id, period_month
+), egilim AS (
+  SELECT aylik.*,
+         LAG(yanit_saati) OVER (PARTITION BY employee_id ORDER BY period_month) AS onceki_yanit_saati,
+         LAG(cevapsiz_orani) OVER (PARTITION BY employee_id ORDER BY period_month) AS onceki_cevapsiz_orani
+  FROM aylik
+)
+SELECT employee_id,
+       period_month,
+       ROUND(yanit_saati, 1) AS yanit_saati,
+       ROUND(yanit_saati - onceki_yanit_saati, 1) AS yanit_saati_degisim,
+       ROUND(cevapsiz_orani - onceki_cevapsiz_orani, 2) AS cevapsiz_orani_degisim
+FROM egilim
+WHERE onceki_yanit_saati IS NOT NULL
+ORDER BY yanit_saati_degisim DESC;
+
 -- ---------------------------------------------------------------------
 -- C. SİMÜLASYONUN CEVAP ANAHTARI
 -- ---------------------------------------------------------------------
@@ -222,7 +348,9 @@ SELECT CONCAT(v.first_name, ' ', v.last_name) AS calisan,
        s.has_overload,
        s.has_exclusion,
        s.has_leave_denial,
-       s.has_unfair_evaluation
+       s.has_unfair_evaluation,
+       s.has_request_ignoring,
+       s.has_public_criticism
 FROM simulation_scenarios s
 JOIN employees v ON v.employee_id = s.employee_id
 JOIN employees p ON p.employee_id = s.perpetrator_id
@@ -253,6 +381,109 @@ JOIN (
   GROUP BY employee_id, period_month
 ) o ON o.employee_id = l.employee_id AND o.period_month = l.period_month
 GROUP BY l.is_mobbing;
+
+-- C4. Başlangıç modeli için çalışan-ay özellik matrisi.
+-- simulation_* alanlarından yalnız hedef etiket ve veri bölmesi en sonda eklenir;
+-- bu ikisi özellik olarak modele verilmez.
+WITH
+mesai AS (
+  SELECT employee_id,
+         DATE_FORMAT(work_date, '%Y-%m-01') AS period_month,
+         SUM(CASE WHEN WEEKDAY(work_date) >= 5
+                  THEN TIME_TO_SEC(TIMEDIFF(check_out, check_in))
+                  ELSE GREATEST(TIME_TO_SEC(TIMEDIFF(check_out, check_in)) - 9 * 3600, 0) END) / 3600 AS ek_mesai,
+         SUM(WEEKDAY(work_date) >= 5) AS hafta_sonu
+  FROM attendance_logs
+  GROUP BY employee_id, period_month
+), izin AS (
+  SELECT employee_id,
+         DATE_FORMAT(requested_at, '%Y-%m-01') AS period_month,
+         COUNT(*) AS izin_talebi,
+         AVG(status = 'rejected') AS izin_ret_orani,
+         AVG(TIMESTAMPDIFF(HOUR, requested_at, decided_at)) AS izin_karar_saati
+  FROM leave_requests
+  GROUP BY employee_id, period_month
+), gorev_degisim AS (
+  SELECT task_id,
+         SUM(change_type = 'deadline_shortened') AS sure_kisaltma,
+         SUM(change_type = 'priority_increased') AS oncelik_artirma
+  FROM task_changes
+  GROUP BY task_id
+), gorev AS (
+  SELECT t.assigned_to AS employee_id,
+         DATE_FORMAT(t.assigned_at, '%Y-%m-01') AS period_month,
+         COUNT(*) AS gorev_sayisi,
+         AVG(WEEKDAY(t.assigned_at) >= 5 OR HOUR(t.assigned_at) >= 19 OR HOUR(t.assigned_at) < 7) AS mesai_disi_orani,
+         AVG(TIMESTAMPDIFF(HOUR, t.assigned_at, t.due_at) <= 24) AS dar_sure_orani,
+         AVG(t.completed_at > t.due_at) AS gecikme_orani,
+         AVG(t.actual_hours / NULLIF(t.estimated_hours, 0)) AS efor_orani,
+         SUM(COALESCE(gd.sure_kisaltma, 0)) AS sure_kisaltma,
+         SUM(COALESCE(gd.oncelik_artirma, 0)) AS oncelik_artirma
+  FROM tasks t
+  LEFT JOIN gorev_degisim gd ON gd.task_id = t.task_id
+  GROUP BY t.assigned_to, period_month
+), talep AS (
+  SELECT requester_id AS employee_id,
+         DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+         COUNT(*) AS talep_sayisi,
+         AVG(first_response_at IS NULL) AS cevapsiz_orani,
+         AVG(TIMESTAMPDIFF(MINUTE, created_at, first_response_at)) / 60 AS yanit_saati
+  FROM employee_requests
+  GROUP BY requester_id, period_month
+), toplanti AS (
+  SELECT e.employee_id,
+         DATE_FORMAT(m.starts_at, '%Y-%m-01') AS period_month,
+         AVG(p.participant_id IS NULL OR p.invitation_status = 'removed') AS erisim_kaybi_orani,
+         AVG(p.participant_id IS NOT NULL AND
+             TIMESTAMPDIFF(MINUTE, p.invited_at, m.starts_at) < 6 * 60) AS gec_davet_orani
+  FROM employees e
+  JOIN meetings m
+    ON m.meeting_type = 'team'
+   AND m.organizer_id = e.manager_id
+   AND DATE(m.starts_at) BETWEEN e.hire_date AND COALESCE(e.termination_date, '9999-12-31')
+  LEFT JOIN meeting_participants p
+    ON p.meeting_id = m.meeting_id AND p.employee_id = e.employee_id
+  GROUP BY e.employee_id, period_month
+), geri_bildirim AS (
+  SELECT employee_id,
+         DATE_FORMAT(created_at, '%Y-%m-01') AS period_month,
+         COUNT(*) AS geri_bildirim_sayisi,
+         AVG(feedback_type IN ('warning','criticism') AND visibility <> 'private') AS topluluk_onunde_olumsuz_orani
+  FROM feedback_events
+  GROUP BY employee_id, period_month
+)
+SELECT l.employee_id,
+       l.period_month,
+       ROUND(COALESCE(m.ek_mesai, 0), 1) AS ek_mesai_saat,
+       COALESCE(m.hafta_sonu, 0) AS hafta_sonu_gun,
+       COALESCE(i.izin_talebi, 0) AS izin_talebi,
+       ROUND(COALESCE(i.izin_ret_orani, 0), 3) AS izin_ret_orani,
+       ROUND(COALESCE(i.izin_karar_saati, 0), 1) AS izin_karar_saati,
+       COALESCE(g.gorev_sayisi, 0) AS gorev_sayisi,
+       ROUND(COALESCE(g.mesai_disi_orani, 0), 3) AS mesai_disi_gorev_orani,
+       ROUND(COALESCE(g.dar_sure_orani, 0), 3) AS dar_sureli_gorev_orani,
+       ROUND(COALESCE(g.gecikme_orani, 0), 3) AS geciken_gorev_orani,
+       ROUND(COALESCE(g.efor_orani, 0), 2) AS gercek_tahmini_efor_orani,
+       COALESCE(g.sure_kisaltma, 0) AS sure_kisaltma,
+       COALESCE(g.oncelik_artirma, 0) AS oncelik_artirma,
+       COALESCE(t.talep_sayisi, 0) AS talep_sayisi,
+       ROUND(COALESCE(t.cevapsiz_orani, 0), 3) AS talep_cevapsiz_orani,
+       ROUND(COALESCE(t.yanit_saati, 0), 1) AS talep_yanit_saati,
+       ROUND(COALESCE(tp.erisim_kaybi_orani, 0), 3) AS toplanti_erisim_kaybi_orani,
+       ROUND(COALESCE(tp.gec_davet_orani, 0), 3) AS gec_toplanti_daveti_orani,
+       COALESCE(gb.geri_bildirim_sayisi, 0) AS geri_bildirim_sayisi,
+       ROUND(COALESCE(gb.topluluk_onunde_olumsuz_orani, 0), 3) AS topluluk_onunde_olumsuz_orani,
+       d.split,
+       l.is_mobbing
+FROM simulation_labels l
+JOIN dataset_splits d ON d.employee_id = l.employee_id
+LEFT JOIN mesai m ON m.employee_id = l.employee_id AND m.period_month = l.period_month
+LEFT JOIN izin i ON i.employee_id = l.employee_id AND i.period_month = l.period_month
+LEFT JOIN gorev g ON g.employee_id = l.employee_id AND g.period_month = l.period_month
+LEFT JOIN talep t ON t.employee_id = l.employee_id AND t.period_month = l.period_month
+LEFT JOIN toplanti tp ON tp.employee_id = l.employee_id AND tp.period_month = l.period_month
+LEFT JOIN geri_bildirim gb ON gb.employee_id = l.employee_id AND gb.period_month = l.period_month
+ORDER BY l.employee_id, l.period_month;
 
 -- ---------------------------------------------------------------------
 -- D. TUTARLILIK KONTROLLERİ (hepsinde hata sayısı 0 çıkmalı)
@@ -308,4 +539,28 @@ UNION ALL
 SELECT 'Veri bölmesi olmayan çalışan', COUNT(*)
 FROM employees e
 LEFT JOIN dataset_splits d ON d.employee_id = e.employee_id
-WHERE d.employee_id IS NULL;
+WHERE d.employee_id IS NULL
+UNION ALL
+SELECT 'Sonuç zamanı olup sonucu olmayan veya tersi', COUNT(*)
+FROM employee_requests
+WHERE (resolved_at IS NULL AND outcome IS NOT NULL)
+   OR (resolved_at IS NOT NULL AND outcome IS NULL)
+UNION ALL
+SELECT 'Yanıtı oluşturulma zamanından önce olan talep', COUNT(*)
+FROM employee_requests
+WHERE seen_at < created_at OR first_response_at < created_at OR resolved_at < created_at
+UNION ALL
+SELECT 'Son tarih değişikliği yönü hatalı', COUNT(*)
+FROM task_changes
+WHERE (change_type = 'deadline_shortened' AND new_due_at >= old_due_at)
+   OR (change_type = 'deadline_extended' AND new_due_at <= old_due_at)
+UNION ALL
+SELECT 'Toplantıdan sonra davet edilen', COUNT(*)
+FROM meeting_participants p
+JOIN meetings m ON m.meeting_id = p.meeting_id
+WHERE p.invited_at > m.starts_at
+UNION ALL
+SELECT 'Tamamlanmış görevde gerçek efor eksik veya diğer durumda dolu', COUNT(*)
+FROM tasks
+WHERE (status = 'done' AND actual_hours IS NULL)
+   OR (status <> 'done' AND actual_hours IS NOT NULL);
