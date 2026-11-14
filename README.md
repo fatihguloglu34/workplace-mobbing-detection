@@ -10,6 +10,8 @@ Bu klasör projenin veritabanı kısmıdır: bir şirketi simüle eden MySQL ver
 | `02_seed.sql` | Örnek şirket verisi: 2025 yılı, 200 çalışan |
 | `03_queries.sql` | Örnek sorgular: temel listeler, göstergeler, cevap anahtarı, tutarlılık kontrolleri |
 | `generator/generate_seed.py` | `02_seed.sql` dosyasını üreten Python betiği |
+| `backend/main.py` | Veritabanını okuyan FastAPI uygulaması |
+| `requirements.txt` | Backend için gereken Python paketleri |
 
 ## Kurulum
 
@@ -22,6 +24,24 @@ mysql -u root -p mobbing_risk < 03_queries.sql
 ```
 
 Veritabanının adı `mobbing_risk`. Baştan kurmak için önce `DROP DATABASE mobbing_risk;` çalıştırılır. Dosyalar MySQL 8 için yazıldı; MariaDB 10.4+ (XAMPP) ile uyumlu SQL özellikleri kullanır.
+
+## Backend (FastAPI)
+
+Veritabanı kurulduktan sonra proje klasöründe:
+
+```
+pip install -r requirements.txt
+export DB_URL="mysql+pymysql://root:SIFREN@localhost:3306/mobbing_risk"
+uvicorn backend.main:app --reload
+```
+
+Şifre koda yazılmaz, `DB_URL` ortam değişkeninden okunur. Uygulama açılınca `http://127.0.0.1:8000/docs` adresinden uç noktalar denenebilir:
+
+| Uç nokta | Açıklama |
+|---|---|
+| `GET /departmanlar` | Tüm departmanlar |
+| `GET /overload-analizi` | Departman ortalamasının 1,5 katından fazla görev alanlar (`03_queries.sql` B4) |
+| `POST /tahmin-et` | Görev sayısı, departman ortalaması ve izin red oranından kural tabanlı risk tahmini (`low` / `medium` / `high`) |
 
 ## Tablolar
 
